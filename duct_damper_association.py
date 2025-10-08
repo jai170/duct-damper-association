@@ -1,8 +1,14 @@
 # Import required modules
 import math
+import sys
+import os
 from typing import Dict, List, Tuple, Any, Optional
-from cks_client import CKSClientManager
+
+# Add the cks directory to the Python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'cks'))
+
 from cks_sdk.models import FeatureType
+from cks_sdk.client import CKSClient
 
 # Constants
 DEFAULT_DISTANCE_THRESHOLD = 13.0
@@ -15,15 +21,17 @@ class DuctDamperAssociation:
     Uses one-to-one mapping to ensure each duct can only be assigned to one damper.
     """
     
-    def __init__(self, distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD):
+    def __init__(self, distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD, use_mock: bool = True):
         """
         Initialize the DuctDamperAssociation class.
         
         Args:
             distance_threshold: Maximum distance for damper-duct association
+            use_mock: Whether to use mock data for testing
         """
         self.distance_threshold = distance_threshold
-        self.cks_client = CKSClientManager.get_instance().client
+        # Initialize CKS client with mock data for testing
+        self.cks_client = CKSClient(use_mock=use_mock)
     
     def point_to_line_distance(self, point: Tuple[float, float], line_start: Tuple[float, float], line_end: Tuple[float, float]) -> Tuple[float, str]:
         """
@@ -107,21 +115,23 @@ class DuctDamperAssociation:
         
         return damper_coords
     
-    def extract_duct_coordinates(self, ducts: List[Any]) -> List[Tuple[str, List[Tuple[float, float]]]]:
+    def extract_duct_coordinates(self, ducts: List[Any]) -> List[Tuple[str, Tuple[float, float], Tuple[float, float]]]:
         """
-        Extract duct ID and line coordinates from ducts data.
+        Extract duct ID and line segment coordinates from ducts data.
+        Since ducts only contain one line segment, we extract start and end points.
         
         Args:
             ducts: List of duct objects from CKS
             
         Returns:
-            List of tuples (duct_id, list of (x, y) coordinates forming the line)
+            List of tuples (duct_id, start_point, end_point)
         """
         duct_coords = []
         
         for duct in ducts:
             duct_id = getattr(duct, 'id', 'unknown')
-            coordinates = []
+            start_point = None
+            end_point = None
             
             if hasattr(duct, 'final_geojson') and duct.final_geojson:
                 geojson = duct.final_geojson
@@ -130,79 +140,55 @@ class DuctDamperAssociation:
                     if 'geometry' in feature and 'coordinates' in feature['geometry']:
                         coords = feature['geometry']['coordinates']
                         if len(coords) >= 2:
-                            coordinates = [(float(coord[0]), float(coord[1])) for coord in coords]
+                            start_point = (float(coords[0][0]), float(coords[0][1]))
+                            end_point = (float(coords[1][0]), float(coords[1][1]))
             
-            if coordinates:
-                duct_coords.append((duct_id, coordinates))
+            if start_point and end_point:
+                duct_coords.append((duct_id, start_point, end_point))
         
         return duct_coords
     
-    def map_dampers_to_ducts(self, damper_coords: List[Tuple[str, Tuple[float, float]]], 
-                            duct_coords: List[Tuple[str, List[Tuple[float, float]]]]) -> Dict[str, str]:
+    def map_damper_to_ducts(self, damper_coord: Tuple[str, Tuple[float, float]], 
+                           duct_coords: List[Tuple[str, Tuple[float, float], Tuple[float, float]]]) -> str:
         """
-        Map each damper to the closest duct based on perpendicular distance using one-to-one mapping.
+        Map a single damper to the closest duct based on perpendicular distance.
         Prioritizes actual intersections over extended intersections.
-        Uses greedy assignment to ensure each duct can only be assigned to one damper.
+        Multiple dampers can be associated with the same duct.
         
         Args:
-            damper_coords: List of (damper_id, (x, y)) tuples
-            duct_coords: List of (duct_id, list of (x, y)) tuples
+            damper_coord: (damper_id, (x, y)) tuple
+            duct_coords: List of (duct_id, start_point, end_point) tuples
             
         Returns:
-            Dictionary mapping damper_id to duct_id (or 'NA' if no association)
+            duct_id if association is made, 'NA' if no association
         """
-        # Build all candidate pairs with intersection type and distance
-        candidate_pairs: List[Tuple[str, float, int, int]] = []  # (intersection_type, distance, damper_idx, duct_idx)
+        damper_id, damper_point = damper_coord
         
-        for d_idx, (damper_id, damper_point) in enumerate(damper_coords):
-            for duct_idx, (duct_id, duct_line_coords) in enumerate(duct_coords):
-                # Calculate distance to each line segment in the duct
-                min_distance = float('inf')
-                best_intersection_type = "none"
-                
-                for i in range(len(duct_line_coords) - 1):
-                    line_start = duct_line_coords[i]
-                    line_end = duct_line_coords[i + 1]
-                    
-                    distance, intersection_type = self.point_to_line_distance(damper_point, line_start, line_end)
-                    
-                    # Only consider if there's an intersection and distance is better
-                    if intersection_type != "none" and distance < min_distance:
-                        min_distance = distance
-                        best_intersection_type = intersection_type
-                
-                # Add to candidates if within threshold and has intersection
-                if best_intersection_type != "none" and min_distance <= self.distance_threshold:
-                    candidate_pairs.append((best_intersection_type, min_distance, d_idx, duct_idx))
+        # Find the best duct for this damper
+        best_duct_id = 'NA'
+        best_distance = float('inf')
+        best_intersection_type = "none"
         
-        # Sort by intersection type priority (actual first, then extended), then by distance
-        def sort_key(t):
-            intersection_type, distance, _, _ = t
-            # Priority: actual=0, extended=1 (so actual comes first)
-            type_priority = 0 if intersection_type == "actual" else 1
-            return (type_priority, distance)
-        
-        candidate_pairs.sort(key=sort_key)
-        print(candidate_pairs)
-        
-        # Track which ducts have been used
-        duct_used: List[bool] = [False] * len(duct_coords)
-        
-        # Initialize mapping - all dampers start as unmapped
-        damper_to_duct_mapping = {damper_id: 'NA' for damper_id, _ in damper_coords}
-        
-        # Iterate through sorted pairs and assign if duct is available
-        for _, _, damper_idx, duct_idx in candidate_pairs:
-            if duct_used[duct_idx]:
-                continue  # This duct is already assigned to another damper
+        for duct_id, start_point, end_point in duct_coords:
+            # Calculate distance to the single line segment of this duct
+            distance, intersection_type = self.point_to_line_distance(damper_point, start_point, end_point)
             
-            # Assign this damper to the duct
-            damper_id = damper_coords[damper_idx][0]
-            duct_id = duct_coords[duct_idx][0]
-            damper_to_duct_mapping[damper_id] = duct_id
-            duct_used[duct_idx] = True
+            # Check if this duct is better than current best
+            if intersection_type != "none" and distance <= self.distance_threshold:
+                # Priority: actual=0, extended=1 (so actual comes first)
+                current_priority = 0 if intersection_type == "actual" else 1
+                best_priority = 0 if best_intersection_type == "actual" else 1
+                
+                # Update best if:
+                # 1. Better intersection type (actual > extended)
+                # 2. Same intersection type but closer distance
+                if (current_priority < best_priority or 
+                    (current_priority == best_priority and distance < best_distance)):
+                    best_duct_id = duct_id
+                    best_distance = distance
+                    best_intersection_type = intersection_type
         
-        return damper_to_duct_mapping
+        return best_duct_id
     
     def retrieve_data_from_cks(self, worksheet_id: str) -> Tuple[List[Any], List[Any]]:
         """
@@ -257,8 +243,12 @@ class DuctDamperAssociation:
             damper_coords = self.extract_damper_coordinates(dampers)
             duct_coords = self.extract_duct_coordinates(ducts)
             
-            # Perform mapping
-            damper_duct_mapping = self.map_dampers_to_ducts(damper_coords, duct_coords)
+            # Perform mapping for each damper individually
+            damper_duct_mapping = {}
+            for damper_coord in damper_coords:
+                damper_id = damper_coord[0]
+                duct_id = self.map_damper_to_ducts(damper_coord, duct_coords)
+                damper_duct_mapping[damper_id] = duct_id
             
             return damper_duct_mapping
             
@@ -279,13 +269,21 @@ def main():
     # Process the worksheet
     try:
         damper_duct_mapping = association.process_worksheet(worksheet_id)
-        #remove this later(just for testing)
+        
         print("_________________________")
-        print("damper_duct_mapping:")
-        print(damper_duct_mapping)
+        print("Damper to Duct Mapping:")
+        print("_________________________")
+        
+        # Iterate through each damper and print the mapping
+        for damper_id, duct_id in damper_duct_mapping.items():
+            print(f"Damper ID: {damper_id} -> Duct ID: {duct_id}")
+        
+        print("_________________________")
+        print(f"Total dampers processed: {len(damper_duct_mapping)}")
         
         return damper_duct_mapping
     except Exception as e:
+        print(f"Error processing worksheet: {str(e)}")
         return {}
 
 
